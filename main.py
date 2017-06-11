@@ -161,12 +161,12 @@ class AlexaSiteAnalyzer(object):
         site_stats = self.SiteStats(domain_name=url, duration_in_ms=duration, word_count=len(words))
         self.overall_stats.site_stats.append(site_stats)
 
-        for header in headers:
+        for header in set(headers):
             stats = self.overall_stats.header_stats.get(header)
             if not stats:
                 stats = self.HeaderStats()
             stats.site_count += 1
-            stats.percentage = stats.site_count / self.TOTAL_SITES_TO_PROCESS * 100
+            stats.percentage = float(stats.site_count) / float(self.TOTAL_SITES_TO_PROCESS) * 100.0
             self.overall_stats.header_stats[header] = stats
 
     def _create_alexa_topsite_request_url(self, page_num):
