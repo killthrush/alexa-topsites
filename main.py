@@ -7,7 +7,7 @@ import json, datetime, re
 import hashlib, base64, hmac
 from xml.etree.ElementTree import ElementTree, fromstring
 from bs4 import BeautifulSoup
-from timer import Timer
+from timer import EventLoopTimer
 
 
 class AlexaSiteAnalyzer(object):
@@ -29,9 +29,10 @@ class AlexaSiteAnalyzer(object):
 
     def __init__(self, aws_key_id, aws_secret_key):
         self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{year}-{month}-{day}.json'
-        self.TOTAL_SITES_TO_PROCESS = 20 # should be 1000, but we want to get this working for a small number first
+        self.TOTAL_SITES_TO_PROCESS = 1000
+        self.BATCH_SIZE = 50 # The number of sites to query concurrently
         self.SITES_PER_PAGE = 100 # 100 is the default (and max) page size for Alexa Top Sites
-        self.ASYNC_TIMEOUT = 1000
+        self.ASYNC_TIMEOUT_SECONDS = 10
         self.page_rank_heap = []
         self.aws_key_id = aws_key_id
         self.aws_secret_key = aws_secret_key
@@ -73,16 +74,33 @@ class AlexaSiteAnalyzer(object):
         Returns:
             An instance of OverallStats which contains the desired information (see class docs)
         """
-        with Timer() as stopwatch:
+        with EventLoopTimer(self.event_loop) as stopwatch:
             domains = self._get_top_site_domains()
-            self.event_loop.run_until_complete(self._query_top_sites(domains[:self.TOTAL_SITES_TO_PROCESS]))
-            sites_sorted_by_word_count = sorted(self.overall_stats.site_stats, key=lambda x: x.word_count, reverse=True)
+            print('Processing {} unique domains...'.format(len(domains)))
+
+            # Performance gets a little weird when trying to do hundreds of concurrent requests.
+            # It seems to be a lot more stable (and faster overall) to batch the requests into smaller groups.
+            for batch_num in range(0, int(self.TOTAL_SITES_TO_PROCESS / self.BATCH_SIZE)):
+                begin_index = 0 + (batch_num * self.BATCH_SIZE)
+                end_index = self.BATCH_SIZE + begin_index
+                self.event_loop.run_until_complete(self._query_top_sites(domains[begin_index:end_index]))
+
+        # Process overall stats
         word_count_sum = 0
+        sites_sorted_by_word_count = sorted(self.overall_stats.site_stats, key=lambda x: x.word_count, reverse=True)
         for i, site in enumerate(sites_sorted_by_word_count):
             site.word_count_ranking = 1 + i
             word_count_sum += site.word_count
         self.overall_stats.average_word_count = word_count_sum / self.TOTAL_SITES_TO_PROCESS
         self.overall_stats.duration_in_ms = stopwatch.interval * 1000
+
+        # Note that if I sum the duration of the individual scans, the often don't match
+        # the duration of the overall scan.  They're in the ballpark but off by just enough to
+        # make me think that I'm doing something wrong somehwere.
+        expected_sum = sum([site.duration_in_ms for site in self.overall_stats.site_stats])
+        print('Expected MS: {}'.format(expected_sum))
+        print('Overall count of sites (minus errors): {}'.format(len(sites_sorted_by_word_count)))
+        print('Overall count of errors: {}'.format(len(self.overall_stats.error_list)))
         return self.overall_stats
 
     async def _process_site(self, session, url):
@@ -97,22 +115,27 @@ class AlexaSiteAnalyzer(object):
         Returns:
             Asynchronously returns a 5-tuple: (url, HTML content, header collection, error message, duration)
         """
-        with Timer() as stopwatch:
-            page_text, response_headers, error_message = None, None, None
-            with async_timeout.timeout(self.ASYNC_TIMEOUT):
-                try:
-                    # Attempt to fool the bot-blockers...
-                    headers = {
-                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
-                    }
-                    async with session.get(url, headers=headers) as response:
-                        print('Got response for {}'.format(url))
+        page_text, response_headers, error_message, duration = (None,) * 4
+        try:
+            with async_timeout.timeout(self.ASYNC_TIMEOUT_SECONDS):
+                # Attempt to fool the bot-blockers...
+                headers = {
+                    'User-Agent': (
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko)'
+                        'Chrome/35.0.1916.47 Safari/537.36'
+                    )
+                }
+                print('Making request for {}'.format(url))
+                async with session.get(url, headers=headers) as response:
+                    with EventLoopTimer(self.event_loop) as stopwatch:
                         page_text = await response.text(encoding='utf-8')
                         response_headers = response.headers
-                except Exception as e:
-                    print(e)
-                    error_message = e
-        return url, page_text, response_headers, error_message, stopwatch.interval * 1000
+                        print('Got response for {}'.format(url))
+                    duration = stopwatch.interval * 1000
+        except Exception as e:
+            print(e)
+            error_message = str(e)
+        return url, page_text, response_headers, error_message, duration
 
     async def _query_top_sites(self, domains):
         """
@@ -145,7 +168,7 @@ class AlexaSiteAnalyzer(object):
         Returns:
             None
         """
-        url, content, headers, error, duration = future.result()
+        url, content, headers, error, request_duration = future.result()
         if not content or not headers:
             print('Processing error response for {}'.format(url))
             error_item = self.ErrorItem(domain_name=url, error_message=error)
@@ -153,21 +176,24 @@ class AlexaSiteAnalyzer(object):
             return
         print('Loaded valid response for {}'.format(url))
 
-        soup = BeautifulSoup(content, 'html.parser')
-        [s.extract() for s in soup('script')]
-        [s.extract() for s in soup('style')]
-        text = soup.get_text().strip()
-        words = re.split('\s+', text)
-        site_stats = self.SiteStats(domain_name=url, duration_in_ms=duration, word_count=len(words))
-        self.overall_stats.site_stats.append(site_stats)
+        scan_duration = request_duration
+        with EventLoopTimer(self.event_loop) as stopwatch:
+            soup = BeautifulSoup(content, 'html.parser')
+            [s.extract() for s in soup('script')]
+            [s.extract() for s in soup('style')]
+            text = soup.get_text().strip()
+            words = re.split('\s+', text)
 
-        for header in set(headers):
-            stats = self.overall_stats.header_stats.get(header)
-            if not stats:
-                stats = self.HeaderStats()
-            stats.site_count += 1
-            stats.percentage = float(stats.site_count) / float(self.TOTAL_SITES_TO_PROCESS) * 100.0
-            self.overall_stats.header_stats[header] = stats
+            for header in set(headers):
+                stats = self.overall_stats.header_stats.get(header)
+                if not stats:
+                    stats = self.HeaderStats()
+                stats.site_count += 1
+                stats.percentage = float(stats.site_count) / float(self.TOTAL_SITES_TO_PROCESS) * 100.0
+                self.overall_stats.header_stats[header] = stats
+        scan_duration += stopwatch.interval * 1000
+        site_stats = self.SiteStats(domain_name=url, duration_in_ms=scan_duration, word_count=len(words))
+        self.overall_stats.site_stats.append(site_stats)
 
     def _create_alexa_topsite_request_url(self, page_num):
         """
@@ -257,12 +283,15 @@ class AlexaSiteAnalyzer(object):
         cache_filename = self.CACHE_LOCATION.format(**params)
         all_domains = []
         if os.path.exists(cache_filename):
+            print('Loading domain list from cache: {}'.format(cache_filename))
             with open(cache_filename, 'r') as cache_file:
                 all_domains = json.loads(cache_file.read())
         else:
+            print('Loading domain list from AWS...')
             num_pages = int(self.TOTAL_SITES_TO_PROCESS / self.SITES_PER_PAGE)
             for page_num in range(1, num_pages + 1):
                 url = self._create_alexa_topsite_request_url(page_num)
+                print('Querying Top Sites Service: {}'.format(url))
                 with urllib.request.urlopen(url) as response:
                    xml_data = response.read().decode("utf-8")
                 domains = self._parse_site_info_from_xml(xml_data)
