@@ -1,16 +1,11 @@
-import os
-import sys
+import os, sys
 import attr
-import urllib.parse
-import urllib.request
+import urllib.parse, urllib.request
+import asyncio, aiohttp, async_timeout
 import getopt
-import asyncio
 import heapq
-import json
-import datetime
-import hashlib
-import base64
-import hmac
+import json, datetime
+import hashlib, base64, hmac
 from xml.etree.ElementTree import ElementTree, fromstring
 from bs4 import BeautifulSoup
 
@@ -36,13 +31,17 @@ class AlexaSiteAnalyzer(object):
         self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{year}-{month}-{day}.json'
         self.TOTAL_SITES_TO_PROCESS = 1000
         self.SITES_PER_PAGE = 100 # 100 is the default (and max) page size for Alexa Top Sites
+        self.ASYNC_TIMEOUT = 1000
         self.global_site_counter = 0
         self.page_rank_heap = []
         self.aws_key_id = aws_key_id
         self.aws_secret_key = aws_secret_key
+        self.event_loop = asyncio.get_event_loop()
+        self.overall_stats = self.OverallStats()
 
     @attr.s
     class SiteStats(object):
+        domain_name = attr.ib()
         process_count = attr.ib()
         duration_in_ms = attr.ib()
         word_count = attr.ib()
@@ -50,14 +49,21 @@ class AlexaSiteAnalyzer(object):
 
     @attr.s
     class OverallStats(object):
-        average_word_count = attr.ib()
-        duration_in_ms = attr.ib()
-        site_stats = attr.ib(default=attr.Factory)
+        average_word_count = attr.ib(default=None)
+        duration_in_ms = attr.ib(default=None)
+        site_stats = attr.ib(default=attr.Factory(list))
+        header_stats = attr.ib(default=attr.Factory(list))
+        error_list = attr.ib(default=attr.Factory(list))
 
     @attr.s
     class HeaderStats(object):
         header_name = attr.ib()
-        percentage = attr.ib()
+        percentage = attr.ib(default=None)
+
+    @attr.s
+    class ErrorItem(object):
+        domain_name = attr.ib()
+        error_message = attr.ib()
 
     def run(self):
         """
@@ -69,7 +75,73 @@ class AlexaSiteAnalyzer(object):
         Returns:
             None
         """
-        pass
+        domains = self._get_top_site_domains()
+        self.event_loop.run_until_complete(self._query_top_sites(domains[:20]))
+        print('quitting!')
+
+    async def _process_site(self, session, url):
+        """
+        Using an async-friendly web client, query a given site and
+        return its content HTML and headers.
+
+        Args:
+            session: An open aiohttp client that will be used to query the site
+            url: The URL to query
+
+        Returns:
+            Asynchronously returns a 4-tuple: (url, HTML content, header collection, error message)
+        """
+        with async_timeout.timeout(self.ASYNC_TIMEOUT):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
+                }
+                async with session.get(url, headers=headers) as response:
+                    print('Got response for {}'.format(url))
+                    page_text = await response.text(encoding='utf-8')
+                    return url, page_text, response.headers, None
+            except Exception as e:
+                print(e)
+                return url, None, None, e
+
+    async def _query_top_sites(self, domains):
+        """
+        Using an event loop, query the Top Sites in parallel and record some stats.
+
+        Args:
+            domains: A list of domain names of a number of top sites to analyze
+
+        Returns:
+            None
+        """
+        tasks = []
+        async with aiohttp.ClientSession(loop=self.event_loop) as session:
+            for domain in domains:
+                url = 'http://{}'.format(domain)
+                task = self.event_loop.create_task(self._process_site(session, url))
+                task.add_done_callback(self._analyze_site_output)
+                tasks.append(task)
+                print('Created task for {}'.format(url))
+            await asyncio.wait(tasks)
+
+    def _analyze_site_output(self, future):
+        """
+        Callback function for the task that fetches data from one of the top sites.
+
+        Args:
+            future: The resolved future object that should contain the results of the task.
+                    Might not have values in it due to things like connection errors.
+
+        Returns:
+            None
+        """
+        url, content, headers, error = future.result()
+        if not content or not headers:
+            print('Processing error response for {}'.format(url))
+            error_item = self.ErrorItem(domain_name=url, error_message=error)
+            self.overall_stats.error_list.append(error_item)
+            return
+        print('Loaded valid response for {}'.format(url))
 
     def _create_alexa_topsite_request_url(self, page_num):
         """
@@ -175,13 +247,6 @@ class AlexaSiteAnalyzer(object):
         return all_domains
 
 
-
-# with a timer, grab 1000 top sites
-    # parse xml, fetch data from the 1000 sites in parallel using asyncio
-    # each request is timed
-    # count words using beautiful soup, record headers, create stats record, and add to the ranking heap
-# record overall site stats, create site ranking and return results
-
 def process_command_line(all_args):
     """
     Parses command-line options and runs the analyzer
@@ -209,9 +274,7 @@ def process_command_line(all_args):
             aws_secret_key = arg
 
     analyzer = AlexaSiteAnalyzer(aws_key_id=aws_key_id, aws_secret_key=aws_secret_key)
-
-    # Test the URL gen & signing
-    print(analyzer._get_top_site_domains())
+    analyzer.run()
 
 
 if __name__ == '__main__':
