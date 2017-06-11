@@ -20,5 +20,5 @@ venv/bin/pip install -U -r requirements.txt
 Lastly, to run the app, you may use the following:
 
 ```
-main.py -k <AWS-KEY-ID> -s <AWS-SECRET-KEY>
+python main.py -k <AWS-KEY-ID> -s <AWS-SECRET-KEY>
 ```
