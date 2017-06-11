@@ -11,6 +11,7 @@ import datetime
 import hashlib
 import base64
 import hmac
+from xml.etree.ElementTree import ElementTree, fromstring
 from bs4 import BeautifulSoup
 
 
@@ -32,7 +33,7 @@ class AlexaSiteAnalyzer(object):
     """
 
     def __init__(self, aws_key_id, aws_secret_key):
-        self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{yyyy}-{mm}-{dd}.json'
+        self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{year}-{month}-{day}.json'
         self.TOTAL_SITES_TO_PROCESS = 1000
         self.SITES_PER_PAGE = 100 # 100 is the default (and max) page size for Alexa Top Sites
         self.global_site_counter = 0
@@ -61,13 +62,29 @@ class AlexaSiteAnalyzer(object):
     def run(self):
         """
         Runs the Alexa Site Analyzer and returns metadata in a structured format.
-        Returns:
 
+        Args:
+            None
+
+        Returns:
+            None
         """
         pass
 
     def _create_alexa_topsite_request_url(self, page_num):
+        """
+        Constructs a request to the AWS Alexa Top Sites Service.
+        The process includes a signature; this mechanism is documented here:
+        http://docs.aws.amazon.com/AlexaTopSites/latest/
 
+        Args:
+            page_num: Each request must include a record offset, since only 100
+                      records may be returned at one time from the service. This
+                      page number allows us to compute the appropriaate offset.
+
+        Returns:
+            A string containing the full absolute URL of a valid Top Sites request
+        """
         signature_template = (
             'GET\n'
             'ats.amazonaws.com\n'
@@ -96,14 +113,41 @@ class AlexaSiteAnalyzer(object):
         signed_url = '{}&{}'.format(base_url, encoded_signature)
         return signed_url
 
-    def _parse_site_info_from_xml(self):
-        pass
-
-    def _fetch_top_sites_xml(self, ):
+    def _parse_site_info_from_xml(self, xml):
         """
-        Attempt to load the Alexa Top Sites XML either from a local copy
+        Given XML in the Top Sites format, pull out the domains of the sites and return
+        them all in rank order.
+
+        Args:
+            xml: The input XML (format is here:
+                 https://docs.aws.amazon.com/AlexaTopSites/latest/index.html?ApiReference_TopSitesAction.html)
+
+        Returns:
+            A list(unicode) containing domain name of the top sites
+        """
+        namespace = {
+            'aws': 'http://ats.amazonaws.com/doc/2005-11-21'
+        }
+        tree = ElementTree(fromstring(xml))
+        root = tree.getroot()
+        domain_list = []
+        sites_xpath = 'aws:Response/aws:TopSitesResult/aws:Alexa/aws:TopSites/aws:Country/aws:Sites'
+        sites_element = root.find(sites_xpath, namespace)
+        for site_node in sites_element.findall('aws:Site', namespace):
+            domain = site_node.find('aws:DataUrl', namespace).text
+            domain_list.append(domain)
+        return domain_list
+
+    def _get_top_site_domains(self):
+        """
+        Attempt to load the domain list of Alexa Top Sites either from a local copy
         or from calling AWS.
-        Returns: A string of XML data containing sites.
+
+        Args:
+            None
+
+        Returns:
+            A list of domain name strings.
         """
         now = datetime.datetime.utcnow()
         params = {
@@ -113,26 +157,30 @@ class AlexaSiteAnalyzer(object):
             'day': now.day,
         }
         cache_filename = self.CACHE_LOCATION.format(**params)
-        site_data = None
+        all_domains = []
         if os.path.exists(cache_filename):
             with open(cache_filename, 'r') as cache_file:
-                site_data = json.loads(cache_file.read())
+                all_domains = json.loads(cache_file.read())
         else:
-            num_pages = self.TOTAL_SITES_TO_PROCESS / self.SITES_PER_PAGE
+            num_pages = int(self.TOTAL_SITES_TO_PROCESS / self.SITES_PER_PAGE)
             for page_num in range(1, num_pages + 1):
                 url = self._create_alexa_topsite_request_url(page_num)
+                with urllib.request.urlopen(url) as response:
+                   xml_data = response.read().decode("utf-8")
+                domains = self._parse_site_info_from_xml(xml_data)
+                all_domains += domains
+            os.makedirs(os.path.dirname(cache_filename))
+            with open(cache_filename, 'w') as cache_file:
+                cache_file.write(json.dumps(all_domains))
+        return all_domains
 
-        return site_data
 
 
-# on startup, check for local cached file
-# if no cached file, prepare to do main loop
 # with a timer, grab 1000 top sites
     # parse xml, fetch data from the 1000 sites in parallel using asyncio
     # each request is timed
-    # count words using beautiful soup, create stats record, and add to the ranking heap
+    # count words using beautiful soup, record headers, create stats record, and add to the ranking heap
 # record overall site stats, create site ranking and return results
-
 
 def process_command_line(all_args):
     """
@@ -142,7 +190,6 @@ def process_command_line(all_args):
         all_args: The set of all command-line args to process
 
     Returns: None
-
     """
     try:
         opts, args = getopt.getopt(all_args[1:], 'hk:s:', ['aws-key-id=', 'aws-secret-key='])
@@ -164,7 +211,7 @@ def process_command_line(all_args):
     analyzer = AlexaSiteAnalyzer(aws_key_id=aws_key_id, aws_secret_key=aws_secret_key)
 
     # Test the URL gen & signing
-    print(analyzer._create_alexa_topsite_request_url(3))
+    print(analyzer._get_top_site_domains())
 
 
 if __name__ == '__main__':

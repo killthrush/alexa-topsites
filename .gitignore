@@ -102,3 +102,6 @@ ENV/
 
 # Pycharm stuff
 .idea
+
+# App-specific temp files
+temp
