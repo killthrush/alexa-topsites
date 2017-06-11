@@ -28,7 +28,7 @@ class AlexaSiteAnalyzer(object):
     """
 
     def __init__(self, aws_key_id, aws_secret_key):
-        self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{year}-{month}-{day}.json'
+        self.CACHE_LOCATION = '{app_dir}/../temp/alexa-data-{year}-{month}-{day}.json'
         self.TOTAL_SITES_TO_PROCESS = 1000
         self.BATCH_SIZE = 50 # The number of sites to query concurrently
         self.SITES_PER_PAGE = 100 # 100 is the default (and max) page size for Alexa Top Sites
