@@ -3,11 +3,11 @@ import attr
 import urllib.parse, urllib.request
 import asyncio, aiohttp, async_timeout
 import getopt
-import heapq
-import json, datetime
+import json, datetime, re
 import hashlib, base64, hmac
 from xml.etree.ElementTree import ElementTree, fromstring
 from bs4 import BeautifulSoup
+from timer import Timer
 
 
 class AlexaSiteAnalyzer(object):
@@ -29,10 +29,9 @@ class AlexaSiteAnalyzer(object):
 
     def __init__(self, aws_key_id, aws_secret_key):
         self.CACHE_LOCATION = '{app_dir}/temp/alexa-data-{year}-{month}-{day}.json'
-        self.TOTAL_SITES_TO_PROCESS = 1000
+        self.TOTAL_SITES_TO_PROCESS = 20 # should be 1000, but we want to get this working for a small number first
         self.SITES_PER_PAGE = 100 # 100 is the default (and max) page size for Alexa Top Sites
         self.ASYNC_TIMEOUT = 1000
-        self.global_site_counter = 0
         self.page_rank_heap = []
         self.aws_key_id = aws_key_id
         self.aws_secret_key = aws_secret_key
@@ -42,7 +41,6 @@ class AlexaSiteAnalyzer(object):
     @attr.s
     class SiteStats(object):
         domain_name = attr.ib()
-        process_count = attr.ib()
         duration_in_ms = attr.ib()
         word_count = attr.ib()
         word_count_ranking = attr.ib(default=None)
@@ -52,13 +50,13 @@ class AlexaSiteAnalyzer(object):
         average_word_count = attr.ib(default=None)
         duration_in_ms = attr.ib(default=None)
         site_stats = attr.ib(default=attr.Factory(list))
-        header_stats = attr.ib(default=attr.Factory(list))
+        header_stats = attr.ib(default=attr.Factory(dict))
         error_list = attr.ib(default=attr.Factory(list))
 
     @attr.s
     class HeaderStats(object):
-        header_name = attr.ib()
-        percentage = attr.ib(default=None)
+        site_count = attr.ib(default=0)
+        percentage = attr.ib(default=0.0)
 
     @attr.s
     class ErrorItem(object):
@@ -76,33 +74,44 @@ class AlexaSiteAnalyzer(object):
             None
         """
         domains = self._get_top_site_domains()
-        self.event_loop.run_until_complete(self._query_top_sites(domains[:20]))
+        self.event_loop.run_until_complete(self._query_top_sites(domains[:self.TOTAL_SITES_TO_PROCESS]))
+        sites_sorted_by_word_count = sorted(self.overall_stats.site_stats, key=lambda x: x.word_count, reverse=True)
+        word_count_sum = 0
+        for i, site in enumerate(sites_sorted_by_word_count):
+            site.word_count_ranking = 1 + i
+            word_count_sum += site.word_count
+        self.overall_stats.average_word_count = word_count_sum / self.TOTAL_SITES_TO_PROCESS
+        print(attr.asdict(self.overall_stats))
         print('quitting!')
 
     async def _process_site(self, session, url):
         """
         Using an async-friendly web client, query a given site and
-        return its content HTML and headers.
+        return its content HTML and headers along with its duration and any errors.
 
         Args:
             session: An open aiohttp client that will be used to query the site
             url: The URL to query
 
         Returns:
-            Asynchronously returns a 4-tuple: (url, HTML content, header collection, error message)
+            Asynchronously returns a 5-tuple: (url, HTML content, header collection, error message, duration)
         """
-        with async_timeout.timeout(self.ASYNC_TIMEOUT):
-            try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
-                }
-                async with session.get(url, headers=headers) as response:
-                    print('Got response for {}'.format(url))
-                    page_text = await response.text(encoding='utf-8')
-                    return url, page_text, response.headers, None
-            except Exception as e:
-                print(e)
-                return url, None, None, e
+        with Timer() as stopwatch:
+            page_text, response_headers, error_message = None, None, None
+            with async_timeout.timeout(self.ASYNC_TIMEOUT):
+                try:
+                    # Attempt to fool the bot-blockers...
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.47 Safari/537.36'
+                    }
+                    async with session.get(url, headers=headers) as response:
+                        print('Got response for {}'.format(url))
+                        page_text = await response.text(encoding='utf-8')
+                        response_headers = response.headers
+                except Exception as e:
+                    print(e)
+                    error_message = e
+        return url, page_text, response_headers, error_message, stopwatch.interval * 1000
 
     async def _query_top_sites(self, domains):
         """
@@ -135,13 +144,29 @@ class AlexaSiteAnalyzer(object):
         Returns:
             None
         """
-        url, content, headers, error = future.result()
+        url, content, headers, error, duration = future.result()
         if not content or not headers:
             print('Processing error response for {}'.format(url))
             error_item = self.ErrorItem(domain_name=url, error_message=error)
             self.overall_stats.error_list.append(error_item)
             return
         print('Loaded valid response for {}'.format(url))
+
+        soup = BeautifulSoup(content, 'html.parser')
+        [s.extract() for s in soup('script')]
+        [s.extract() for s in soup('style')]
+        text = soup.get_text().strip()
+        words = re.split('\s+', text)
+        site_stats = self.SiteStats(domain_name=url, duration_in_ms=duration, word_count=len(words))
+        self.overall_stats.site_stats.append(site_stats)
+
+        for header in headers:
+            stats = self.overall_stats.header_stats.get(header)
+            if not stats:
+                stats = self.HeaderStats()
+            stats.site_count += 1
+            stats.percentage = stats.site_count / self.TOTAL_SITES_TO_PROCESS * 100
+            self.overall_stats.header_stats[header] = stats
 
     def _create_alexa_topsite_request_url(self, page_num):
         """
