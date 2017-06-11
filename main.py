@@ -65,24 +65,25 @@ class AlexaSiteAnalyzer(object):
 
     def run(self):
         """
-        Runs the Alexa Site Analyzer and returns metadata in a structured format.
+        Runs the Alexa Site Analyzer and returns site metadata in a structured format.
 
         Args:
             None
 
         Returns:
-            None
+            An instance of OverallStats which contains the desired information (see class docs)
         """
-        domains = self._get_top_site_domains()
-        self.event_loop.run_until_complete(self._query_top_sites(domains[:self.TOTAL_SITES_TO_PROCESS]))
-        sites_sorted_by_word_count = sorted(self.overall_stats.site_stats, key=lambda x: x.word_count, reverse=True)
+        with Timer() as stopwatch:
+            domains = self._get_top_site_domains()
+            self.event_loop.run_until_complete(self._query_top_sites(domains[:self.TOTAL_SITES_TO_PROCESS]))
+            sites_sorted_by_word_count = sorted(self.overall_stats.site_stats, key=lambda x: x.word_count, reverse=True)
         word_count_sum = 0
         for i, site in enumerate(sites_sorted_by_word_count):
             site.word_count_ranking = 1 + i
             word_count_sum += site.word_count
         self.overall_stats.average_word_count = word_count_sum / self.TOTAL_SITES_TO_PROCESS
-        print(attr.asdict(self.overall_stats))
-        print('quitting!')
+        self.overall_stats.duration_in_ms = stopwatch.interval * 1000
+        return self.overall_stats
 
     async def _process_site(self, session, url):
         """
@@ -299,8 +300,9 @@ def process_command_line(all_args):
             aws_secret_key = arg
 
     analyzer = AlexaSiteAnalyzer(aws_key_id=aws_key_id, aws_secret_key=aws_secret_key)
-    analyzer.run()
-
+    output = analyzer.run()
+    print(attr.asdict(output))
+    print('quitting!')
 
 if __name__ == '__main__':
     process_command_line(sys.argv)
