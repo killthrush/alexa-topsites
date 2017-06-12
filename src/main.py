@@ -94,13 +94,6 @@ class AlexaSiteAnalyzer(object):
         self.overall_stats.average_word_count = word_count_sum / self.TOTAL_SITES_TO_PROCESS
         self.overall_stats.duration_in_ms = stopwatch.interval * 1000
 
-        # Note that if I sum the duration of the individual scans, the often don't match
-        # the duration of the overall scan.  They're in the ballpark but off by just enough to
-        # make me think that I'm doing something wrong somehwere.
-        expected_sum = sum([site.duration_in_ms for site in self.overall_stats.site_stats])
-        print('Expected MS: {}'.format(expected_sum))
-        print('Overall count of sites (minus errors): {}'.format(len(sites_sorted_by_word_count)))
-        print('Overall count of errors: {}'.format(len(self.overall_stats.error_list)))
         return self.overall_stats
 
     async def _process_site(self, session, url):
@@ -330,8 +323,41 @@ def process_command_line(all_args):
 
     analyzer = AlexaSiteAnalyzer(aws_key_id=aws_key_id, aws_secret_key=aws_secret_key)
     output = analyzer.run()
-    print(attr.asdict(output))
-    print('quitting!')
+
+    sites_sorted_by_word_count = sorted(output.site_stats, key=lambda x: x.word_count, reverse=True)
+
+    print()
+    print()
+    print('Overall Stats -----------')
+
+    print('Overall count of sites (minus errors): {}'.format(len(sites_sorted_by_word_count)))
+    print('Overall count of errors: {}'.format(len(output.error_list)))
+    print('Average Word count per site: {}'.format(output.average_word_count))
+
+    # Note that if I sum the duration of the individual scans, the often don't match
+    # the duration of the overall scan.  They're in the ballpark but off by just enough to
+    # make me think that I'm doing something wrong somehwere.
+    expected_duration = sum([site.duration_in_ms for site in output.site_stats])
+    print('Expected ms: {}'.format(expected_duration))
+    print('Measured ms: {}'.format(output.duration_in_ms))
+
+    print()
+    print('Top 20 Headers ----------')
+    sorted_headers = list(sorted(output.header_stats.items(), key=lambda x: x[1].site_count, reverse=True))
+    for header, stats in sorted_headers[:20]:
+        print('{} - {} sites, {}% overall'.format(header, stats.site_count, stats.percentage))
+
+    print()
+    print('Site Stats --------------')
+    for site in sites_sorted_by_word_count:
+        print('#{} - {} words - {} - {} ms'.format(site.word_count_ranking, site.word_count,
+                                                   site.domain_name, site.duration_in_ms))
+
+    print()
+    print('Site Errors --------------')
+    for error in output.error_list:
+        print('{} - {}'.format(error.domain_name, error.error_message))
+
 
 if __name__ == '__main__':
     process_command_line(sys.argv)
